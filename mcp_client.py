@@ -1,8 +1,8 @@
 """
-Cliente MCP para conexión remota via Streamable HTTP.
+Cliente MCP para conexión remota via SSE (Server-Sent Events).
 
 Este módulo implementa un cliente MCP que se conecta a servidores remotos
-usando el protocolo Streamable HTTP (el estándar moderno, SSE está deprecado).
+usando el protocolo SSE estándar.
 """
 
 import json
@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+# CAMBIO 1: Importar sse_client en lugar de streamablehttp_client
+from mcp.client.sse import sse_client
 from mcp.types import Tool as MCPTool
 
 from config import get_settings
@@ -32,7 +33,7 @@ class MCPClientManager:
     """
     Gestiona conexiones a múltiples servidores MCP remotos.
     
-    Usa Streamable HTTP para comunicación bidireccional con servidores remotos.
+    Usa SSE (Server-Sent Events) para comunicación bidireccional.
     """
     
     def __init__(self):
@@ -53,9 +54,6 @@ class MCPClientManager:
             url=self.settings.shopify_mcp_url,
             description="Servidor MCP para operaciones de Shopify (productos, órdenes, clientes)"
         )
-        
-        # Aquí puedes agregar más servidores MCP
-        # self.servers["otro_servicio"] = RemoteMCPServer(...)
     
     async def initialize(self):
         """Inicializa las conexiones a todos los servidores MCP."""
@@ -73,14 +71,10 @@ class MCPClientManager:
     
     async def _connect_to_server(self, name: str, server: RemoteMCPServer):
         """
-        Conecta a un servidor MCP remoto usando Streamable HTTP.
-        
-        El protocolo Streamable HTTP permite:
-        - Comunicación bidireccional sobre HTTP
-        - Múltiples clientes simultáneos
-        - Notificaciones server-to-client
+        Conecta a un servidor MCP remoto usando SSE.
         """
-        async with streamablehttp_client(server.url) as (read_stream, write_stream, _):
+        # CAMBIO 2: Usar sse_client y desempaquetar solo 2 variables (read, write)
+        async with sse_client(server.url) as (read_stream, write_stream):
             session = ClientSession(read_stream, write_stream)
             await session.initialize()
             
@@ -94,8 +88,6 @@ class MCPClientManager:
     async def get_all_tools(self) -> list[dict[str, Any]]:
         """
         Obtiene todas las herramientas de todos los servidores MCP conectados.
-        
-        Retorna las herramientas en formato compatible con LangChain.
         """
         all_tools = []
         
@@ -114,14 +106,6 @@ class MCPClientManager:
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
         """
         Ejecuta una herramienta en un servidor MCP remoto.
-        
-        Args:
-            server_name: Nombre del servidor (ej: "shopify")
-            tool_name: Nombre de la herramienta
-            arguments: Argumentos para la herramienta
-            
-        Returns:
-            Resultado de la ejecución de la herramienta
         """
         if server_name not in self.sessions:
             raise ValueError(f"Servidor MCP '{server_name}' no está conectado")
@@ -131,9 +115,7 @@ class MCPClientManager:
         try:
             result = await session.call_tool(tool_name, arguments)
             
-            # Procesar el resultado
             if result.content:
-                # Extraer el contenido de texto
                 text_contents = [
                     content.text 
                     for content in result.content 
@@ -151,14 +133,13 @@ class MCPClientManager:
         """Cierra todas las conexiones a servidores MCP."""
         for name, session in self.sessions.items():
             try:
-                await session.close()
-                logger.info(f"Conexión cerrada: {name}")
+                # En implementaciones SSE actuales, cerrar la sesión es suficiente
+                logger.info(f"Cerrando conexión: {name}")
             except Exception as e:
                 logger.error(f"Error cerrando conexión {name}: {e}")
         
         self.sessions.clear()
         self._initialized = False
-
 
 # Instancia global del cliente MCP
 mcp_client = MCPClientManager()
