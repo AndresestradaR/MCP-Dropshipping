@@ -95,13 +95,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     # FastMCP crea una app ASGI, la corremos con uvicorn
     uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=port)
-```
-
----
-
-**Y el `requirements.txt`** del proyecto MCP-Dropshipping debe tener:
-```
-mcp
-httpx
-python-dotenv
-uvicorn
