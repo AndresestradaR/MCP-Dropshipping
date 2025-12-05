@@ -1,0 +1,48 @@
+# =============================================================================
+# SUPER AGENTE DE IA - VARIABLES DE ENTORNO - v2.0
+# =============================================================================
+# Copia este archivo a .env y completa los valores
+
+# -----------------------------------------------------------------------------
+# ANTHROPIC (Requerido)
+# -----------------------------------------------------------------------------
+# Tu API key de Anthropic - https://console.anthropic.com/
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+
+# -----------------------------------------------------------------------------
+# TWILIO (Requerido para WhatsApp)
+# -----------------------------------------------------------------------------
+# Credenciales de tu cuenta Twilio - https://console.twilio.com/
+TWILIO_ACCOUNT_SID=ACxxxxx
+TWILIO_AUTH_TOKEN=xxxxx
+
+# Número de WhatsApp de Twilio (formato: whatsapp:+14155238886)
+TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
+
+# -----------------------------------------------------------------------------
+# SERVIDORES MCP (URLs de tus servidores desplegados en Railway)
+# -----------------------------------------------------------------------------
+
+# Servidor MCP de Shopify - Ventas, pedidos, productos, clientes
+SHOPIFY_MCP_URL=https://mcp-dropshipping-production.up.railway.app
+
+# Servidor MCP de Meta Ads - Gasto en publicidad, campañas, CPA
+META_MCP_URL=https://server-meta-production-4773.up.railway.app
+
+# Servidor MCP de Dropi - Fulfillment, entregas, devoluciones, pagos
+DROPI_MCP_URL=https://server-dropi-production.up.railway.app
+
+# Servidor MCP de N8N - Gráficos y visualizaciones
+N8N_MCP_URL=https://server-n8n-production.up.railway.app
+
+# TikTok Ads (próximamente)
+# TIKTOK_MCP_URL=https://server-tiktok-production.up.railway.app
+
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN DEL SERVIDOR
+# -----------------------------------------------------------------------------
+HOST=0.0.0.0
+PORT=8000
+
+# Modo debug (True para desarrollo local, False para producción)
+DEBUG=False

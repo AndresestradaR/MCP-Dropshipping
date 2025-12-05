@@ -1,0 +1,18 @@
+# =============================================================================
+# SERVIDOR MCP N8N - VARIABLES DE ENTORNO
+# =============================================================================
+# Este servidor conecta el Cerebro con N8N para generar gráficos
+
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN N8N
+# -----------------------------------------------------------------------------
+# URL base de tu instancia de N8N
+N8N_BASE_URL=https://n8n.srv1121056.hstgr.cloud
+
+# Webhook específico para gráficos
+N8N_WEBHOOK_GRAFICO=https://n8n.srv1121056.hstgr.cloud/webhook/grafico
+
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN DEL SERVIDOR
+# -----------------------------------------------------------------------------
+PORT=3000
