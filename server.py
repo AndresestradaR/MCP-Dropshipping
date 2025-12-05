@@ -100,45 +100,54 @@ if settings.twilio_account_sid and settings.twilio_auth_token:
 def parse_formatted_text(text: str) -> dict:
     """
     Parsea texto formateado de las herramientas MCP.
-    Ejemplo:
-    📊 META ADS (LAST_7D):
-    💸 Gasto: $13,574.00
-    👀 Impresiones: 1,188
-    
-    Retorna: {"gasto": 13574.0, "impresiones": 1188}
+    Soporta múltiples formatos y monedas ($, Q, etc).
     """
     result = {}
     
-    # Buscar patrones de números con formato
-    # Gasto: $13,574.00 → 13574.0
-    gasto_match = re.search(r'Gasto:\s*\$?([\d,]+\.?\d*)', text)
+    # Gasto: $13,574.00 o Gasto: Q13,574.00
+    gasto_match = re.search(r'Gasto:\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
     if gasto_match:
         result['spend'] = float(gasto_match.group(1).replace(',', ''))
     
-    # Impresiones: 1,188 → 1188
-    impresiones_match = re.search(r'Impresiones:\s*([\d,]+)', text)
+    # Impresiones: 1,188
+    impresiones_match = re.search(r'Impresiones:\s*([\d,]+)', text, re.IGNORECASE)
     if impresiones_match:
         result['impressions'] = int(impresiones_match.group(1).replace(',', ''))
     
-    # Clics: 54 → 54
-    clics_match = re.search(r'Clics:\s*([\d,]+)', text)
+    # Clics: 54
+    clics_match = re.search(r'Clics:\s*([\d,]+)', text, re.IGNORECASE)
     if clics_match:
         result['clicks'] = int(clics_match.group(1).replace(',', ''))
     
-    # Saldo: $1,234.56 → 1234.56
-    saldo_match = re.search(r'Saldo:\s*\$?([\d,]+\.?\d*)', text)
+    # Saldo Disponible: Q14,993.71 o Saldo: $1,234.56
+    saldo_match = re.search(r'Saldo\s*(?:Disponible)?:\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
     if saldo_match:
         result['balance'] = float(saldo_match.group(1).replace(',', ''))
     
-    # Total: $1,234.56 → 1234.56
-    total_match = re.search(r'Total.*?:\s*\$?([\d,]+\.?\d*)', text, re.IGNORECASE)
+    # Total: $1,234.56 o Total bruto: $X
+    total_match = re.search(r'Total(?:\s+\w+)?:\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
     if total_match:
         result['total'] = float(total_match.group(1).replace(',', ''))
     
-    # Pedidos: 10 → 10
-    pedidos_match = re.search(r'Pedidos.*?:\s*([\d,]+)', text, re.IGNORECASE)
+    # Pedidos totales: 10 o Pedidos: 10
+    pedidos_match = re.search(r'Pedidos(?:\s+\w+)?:\s*([\d,]+)', text, re.IGNORECASE)
     if pedidos_match:
         result['total_orders'] = int(pedidos_match.group(1).replace(',', ''))
+    
+    # Monto: Q440.00 o Monto: $440
+    monto_match = re.search(r'Monto:\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
+    if monto_match:
+        result['amount'] = float(monto_match.group(1).replace(',', ''))
+    
+    # Entradas/Ingresos: $X
+    entradas_match = re.search(r'(?:Entradas|Ingresos):\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
+    if entradas_match:
+        result['income'] = float(entradas_match.group(1).replace(',', ''))
+    
+    # Salidas/Egresos: $X
+    salidas_match = re.search(r'(?:Salidas|Egresos):\s*[$Q]?([\d,]+\.?\d*)', text, re.IGNORECASE)
+    if salidas_match:
+        result['expenses'] = float(salidas_match.group(1).replace(',', ''))
     
     return result
 
@@ -393,16 +402,50 @@ async def get_dashboard_data(request: Request):
             wallet_result = parse_mcp_result(wallet_raw)
             
             if wallet_result and isinstance(wallet_result, dict):
+                # Usar balance capturado del texto formateado
                 dropi_data["saldo"] = float(wallet_result.get("balance", 0))
-                logger.info(f"💰 Saldo Dropi: ${dropi_data['saldo']:.2f}")
+                logger.info(f"💰 Saldo Dropi: Q{dropi_data['saldo']:,.2f} (${dropi_data['saldo']*0.13:.2f} USD)")
             
             # CORRECTO: get_dropi_wallet_history (no get_wallet_history)
             history_raw = await mcp_client.call_tool("dropi", "get_dropi_wallet_history", {})
             wallet_history = parse_mcp_result(history_raw)
             
             # Wallet history puede venir como lista o dict con lista
-            if isinstance(wallet_history, dict) and "transactions" in wallet_history:
-                wallet_history = wallet_history["transactions"]
+            if isinstance(wallet_history, dict):
+                # Si capturamos income/expenses del texto formateado
+                if "income" in wallet_history:
+                    dropi_data["ingresos_totales"] = wallet_history["income"]
+                if "expenses" in wallet_history:
+                    dropi_data["egresos_totales"] = wallet_history["expenses"]
+                
+                # Extraer lista de transacciones si existe
+                if "transactions" in wallet_history:
+                    wallet_history = wallet_history["transactions"]
+                elif "raw_text" in wallet_history:
+                    # Texto formateado - intentar parsear manualmente
+                    text = wallet_history["raw_text"]
+                    
+                    # Buscar palabras clave para clasificar
+                    if any(word in text.lower() for word in ["pago", "payment", "ingreso", "venta", "cobro"]):
+                        # Es un ingreso
+                        if "amount" in wallet_history or "total" in wallet_history:
+                            monto = wallet_history.get("amount", wallet_history.get("total", 0))
+                            dropi_data["ingresos_totales"] += monto
+                            dropi_data["entradas"].append({
+                                "fecha": "N/A",
+                                "monto": monto,
+                                "concepto": "Transacción"
+                            })
+                    elif any(word in text.lower() for word in ["costo", "cost", "gasto", "expense", "cargo"]):
+                        # Es un egreso
+                        if "amount" in wallet_history or "total" in wallet_history:
+                            monto = wallet_history.get("amount", wallet_history.get("total", 0))
+                            dropi_data["egresos_totales"] += monto
+                            dropi_data["salidas"].append({
+                                "fecha": "N/A",
+                                "monto": monto,
+                                "concepto": "Transacción"
+                            })
             
             if wallet_history and isinstance(wallet_history, list):
                 for transaction in wallet_history:
@@ -424,8 +467,9 @@ async def get_dashboard_data(request: Request):
                         dropi_data["salidas"].append(trans_obj)
                         dropi_data["egresos_totales"] += abs(monto)
                 
-                logger.info(f"💵 Ingresos Dropi: ${dropi_data['ingresos_totales']:.2f}")
-                logger.info(f"💸 Egresos Dropi: ${dropi_data['egresos_totales']:.2f}")
+                if dropi_data["ingresos_totales"] > 0 or dropi_data["egresos_totales"] > 0:
+                    logger.info(f"💵 Ingresos Dropi: Q{dropi_data['ingresos_totales']:,.2f}")
+                    logger.info(f"💸 Egresos Dropi: Q{dropi_data['egresos_totales']:,.2f}")
             
             # CORRECTO: get_dropi_orders (no get_orders)
             orders_raw = await mcp_client.call_tool("dropi", "get_dropi_orders", {})
