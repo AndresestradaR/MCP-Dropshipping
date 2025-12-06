@@ -540,8 +540,8 @@ async def get_dashboard_data(request: Request):
                 meta_data["cpm"] = float(spend_result.get("cpm", 0))
                 meta_data["ctr"] = float(spend_result.get("ctr", 0))
                 
-                if dropi_data["pedidos"] > 0:
-                    meta_data["cpa"] = meta_data["gasto"] / dropi_data["pedidos"]
+                if dropi_data["pedidos"]["total"] > 0:
+                    meta_data["cpa"] = meta_data["gasto"] / dropi_data["pedidos"]["total"]
                 
                 logger.info(f"📢 Gasto Meta: ${meta_data['gasto']:.2f}")
         
@@ -713,3 +713,4 @@ if __name__ == "__main__":
 
     )
     
+
