@@ -1,0 +1,793 @@
+"""
+Servidor MCP para Shopify - v4 DATE RANGE FIX
+Soporta start_date y end_date para consultas de fechas especificas.
+Lee campos personalizados de Releasit COD Form (note_attributes).
+"""
+
+import os
+import json
+import httpx
+import asyncio
+from dotenv import load_dotenv
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.responses import Response, JSONResponse
+from sse_starlette.sse import EventSourceResponse
+import uvicorn
+
+load_dotenv()
+
+SHOPIFY_SHOP_URL = os.getenv("SHOPIFY_SHOP_URL", "").replace("https://", "").replace("/", "")
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+API_VERSION = "2024-01"
+
+sessions = {}
+
+def get_base_url():
+    return f"https://{SHOPIFY_SHOP_URL}/admin/api/{API_VERSION}"
+
+def get_headers():
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+def get_note_attribute(order, key):
+    """Obtiene un atributo de note_attributes por nombre."""
+    note_attrs = order.get("note_attributes", [])
+    for attr in note_attrs:
+        attr_name = attr.get("name", "").lower()
+        if key.lower() in attr_name:
+            return attr.get("value", "")
+    return ""
+
+def get_customer_name(order):
+    """Obtiene el nombre del cliente de note_attributes, billing, shipping o customer."""
+    
+    # 1. Primero buscar en note_attributes (Releasit COD Form)
+    nombre = get_note_attribute(order, "nombre")
+    apellido = get_note_attribute(order, "apellido")
+    if nombre or apellido:
+        return f"{nombre} {apellido}".strip()
+    
+    # También buscar variaciones comunes
+    name = get_note_attribute(order, "name")
+    if name:
+        return name
+    
+    first_name = get_note_attribute(order, "first_name") or get_note_attribute(order, "first name")
+    last_name = get_note_attribute(order, "last_name") or get_note_attribute(order, "last name")
+    if first_name or last_name:
+        return f"{first_name} {last_name}".strip()
+    
+    # 2. Luego billing_address
+    billing = order.get("billing_address", {})
+    if billing:
+        name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
+        if name:
+            return name
+    
+    # 3. Luego shipping_address
+    shipping = order.get("shipping_address", {})
+    if shipping:
+        name = f"{shipping.get('first_name', '')} {shipping.get('last_name', '')}".strip()
+        if name:
+            return name
+    
+    # 4. Finalmente customer
+    customer = order.get("customer", {})
+    if customer:
+        name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+        if name:
+            return name
+    
+    return "Sin nombre"
+
+def get_customer_contact(order):
+    """Obtiene teléfono/WhatsApp y email del cliente."""
+    
+    # 1. Buscar en note_attributes primero (Releasit COD Form)
+    phone = get_note_attribute(order, "whatsapp") or get_note_attribute(order, "telefono") or get_note_attribute(order, "phone") or get_note_attribute(order, "celular")
+    
+    # 2. Buscar email en note_attributes
+    email = get_note_attribute(order, "email") or get_note_attribute(order, "correo")
+    
+    # 3. Si no hay, buscar en campos estándar
+    if not phone:
+        billing = order.get("billing_address", {})
+        shipping = order.get("shipping_address", {})
+        phone = billing.get("phone") or shipping.get("phone") or order.get("phone") or ""
+    
+    if not email:
+        email = order.get("email") or order.get("contact_email") or ""
+        if not email:
+            customer = order.get("customer", {})
+            email = customer.get("email", "")
+    
+    return email or "Sin email", phone or "Sin teléfono"
+
+def get_customer_address(order):
+    """Obtiene la dirección del cliente."""
+    
+    # 1. Buscar en note_attributes primero
+    direccion = get_note_attribute(order, "direccion") or get_note_attribute(order, "dirección") or get_note_attribute(order, "address")
+    departamento = get_note_attribute(order, "departamento") or get_note_attribute(order, "department")
+    municipio = get_note_attribute(order, "municipio") or get_note_attribute(order, "city")
+    referencia = get_note_attribute(order, "referencia") or get_note_attribute(order, "reference")
+    
+    if direccion:
+        parts = [direccion]
+        if municipio:
+            parts.append(municipio)
+        if departamento:
+            parts.append(departamento)
+        if referencia:
+            parts.append(f"(Ref: {referencia})")
+        return ", ".join(parts)
+    
+    # 2. Si no, usar shipping_address estándar
+    shipping = order.get("shipping_address", {})
+    if shipping:
+        parts = []
+        if shipping.get("address1"):
+            parts.append(shipping["address1"])
+        if shipping.get("city"):
+            parts.append(shipping["city"])
+        if shipping.get("province"):
+            parts.append(shipping["province"])
+        return ", ".join(parts) if parts else "Sin dirección"
+    
+    return "Sin dirección"
+
+# ========== HERRAMIENTAS ==========
+
+TOOLS = [
+    {
+        "name": "get_total_sales_today",
+        "description": "Obtiene el total de ventas del dia de hoy (monto total y cantidad de pedidos)",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_recent_orders",
+        "description": "Obtiene los pedidos recientes con detalles: nombre del cliente, WhatsApp, productos comprados, valor, estado de pago",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Cantidad de pedidos a mostrar (default 10, max 50)"},
+                "status": {"type": "string", "description": "Filtrar por estado: any, open, closed, cancelled (default: any)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_order_details",
+        "description": "Obtiene los detalles completos de un pedido especifico por su numero o ID",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "Numero o ID del pedido"}
+            },
+            "required": ["order_id"]
+        }
+    },
+    {
+        "name": "get_sales_by_period",
+        "description": "Obtiene ventas de un periodo. Usar start_date y end_date para fechas especificas como '5 de diciembre'. Para un solo dia, start_date y end_date deben ser iguales.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "description": "Periodo predefinido: today, yesterday, week, month (opcional si usas start_date/end_date)"},
+                "start_date": {"type": "string", "description": "Fecha inicio YYYY-MM-DD (ej: 2025-12-05)"},
+                "end_date": {"type": "string", "description": "Fecha fin YYYY-MM-DD (ej: 2025-12-05)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_all_products",
+        "description": "Lista todos los productos de la tienda con precio, inventario y estado",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Cantidad de productos (default 50)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "check_product_inventory",
+        "description": "Busca un producto por nombre y muestra su inventario detallado",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string", "description": "Nombre del producto a buscar"}
+            },
+            "required": ["product_name"]
+        }
+    },
+    {
+        "name": "get_low_stock_products",
+        "description": "Lista productos con inventario bajo (menos de X unidades)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threshold": {"type": "integer", "description": "Umbral de inventario bajo (default 5)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_recent_customers",
+        "description": "Lista los clientes mas recientes con sus datos de contacto y total de compras",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Cantidad de clientes (default 10)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "search_customer",
+        "description": "Busca un cliente por nombre, email o telefono",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Nombre, email o telefono del cliente"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_top_customers",
+        "description": "Lista los mejores clientes por total de compras",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Cantidad de clientes (default 10)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_shop_info",
+        "description": "Obtiene informacion general de la tienda: nombre, dominio, email, moneda, plan, etc",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_shop_balance",
+        "description": "Obtiene el balance financiero de la tienda",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_best_selling_products",
+        "description": "Lista los productos mas vendidos",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Cantidad de productos (default 10)"}
+            },
+            "required": []
+        }
+    }
+]
+
+# ========== IMPLEMENTACION ==========
+
+async def api_get(endpoint: str, params: dict = None):
+    url = f"{get_base_url()}/{endpoint}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=get_headers(), params=params)
+        if response.status_code != 200:
+            return {"error": f"HTTP {response.status_code}: {response.text}"}
+        return response.json()
+
+async def get_total_sales_today(args: dict) -> str:
+    import datetime
+    today = datetime.date.today().isoformat()
+    data = await api_get("orders.json", {"created_at_min": today, "status": "any"})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    orders = data.get("orders", [])
+    total = sum(float(o.get("total_price", 0)) for o in orders)
+    paid = len([o for o in orders if o.get("financial_status") == "paid"])
+    pending = len([o for o in orders if o.get("financial_status") == "pending"])
+    
+    return f"""📊 VENTAS DE HOY ({today}):
+💰 Total: ${total:,.2f}
+📦 Pedidos: {len(orders)}
+✅ Pagados: {paid}
+⏳ Pendientes: {pending}"""
+
+async def get_recent_orders(args: dict) -> str:
+    limit = min(args.get("limit", 10), 50)
+    status = args.get("status", "any")
+    
+    data = await api_get("orders.json", {"limit": limit, "status": status})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    orders = data.get("orders", [])
+    if not orders:
+        return "No hay pedidos recientes."
+    
+    result = f"📦 ULTIMOS {len(orders)} PEDIDOS:\n\n"
+    
+    for o in orders:
+        order_num = o.get("order_number", o.get("id"))
+        name = get_customer_name(o)
+        email, phone = get_customer_contact(o)
+        total = float(o.get("total_price", 0))
+        fin_status = o.get("financial_status", "unknown")
+        created = o.get("created_at", "")[:10]
+        
+        items = o.get("line_items", [])
+        products = ", ".join([f"{i.get('name', 'Producto')} x{i.get('quantity', 1)}" for i in items[:2]])
+        if len(items) > 2:
+            products += f" (+{len(items)-2} mas)"
+        
+        result += f"""🔹 Pedido #{order_num} - {created}
+   👤 {name}
+   📱 {phone}
+   🛒 {products}
+   💵 ${total:,.2f} - {fin_status}
+
+"""
+    
+    return result
+
+async def get_order_details(args: dict) -> str:
+    order_id = args.get("order_id", "")
+    
+    data = await api_get("orders.json", {"name": order_id, "status": "any"})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    orders = data.get("orders", [])
+    if not orders:
+        data = await api_get(f"orders/{order_id}.json")
+        if "error" in data:
+            return f"No encontre el pedido #{order_id}"
+        order = data.get("order", {})
+    else:
+        order = orders[0]
+    
+    name = get_customer_name(order)
+    email, phone = get_customer_contact(order)
+    address = get_customer_address(order)
+    
+    result = f"""📋 DETALLE PEDIDO #{order.get('order_number', order.get('id'))}
+
+👤 CLIENTE:
+   Nombre: {name}
+   WhatsApp: {phone}
+   Email: {email}
+
+📍 DIRECCION:
+   {address}
+
+🛒 PRODUCTOS:
+"""
+    
+    for item in order.get("line_items", []):
+        result += f"   - {item.get('name')} x{item.get('quantity')} = ${float(item.get('price', 0)):,.2f}\n"
+    
+    result += f"""
+💰 RESUMEN:
+   Subtotal: ${float(order.get('subtotal_price', 0)):,.2f}
+   Envio: ${float(order.get('total_shipping_price_set', {}).get('shop_money', {}).get('amount', 0)):,.2f}
+   TOTAL: ${float(order.get('total_price', 0)):,.2f}
+
+📊 ESTADO:
+   Pago: {order.get('financial_status', 'N/A')}
+   Envio: {order.get('fulfillment_status') or 'No enviado'}
+   Fecha: {order.get('created_at', '')[:19].replace('T', ' ')}
+"""
+    
+    # Mostrar todos los note_attributes si hay
+    note_attrs = order.get("note_attributes", [])
+    if note_attrs:
+        result += "\n📝 INFO ADICIONAL:\n"
+        for attr in note_attrs:
+            result += f"   {attr.get('name')}: {attr.get('value')}\n"
+    
+    return result
+
+async def get_sales_by_period(args: dict) -> str:
+    import datetime
+    
+    # Priorizar fechas específicas
+    start_date_param = args.get("start_date")
+    end_date_param = args.get("end_date")
+    period = args.get("period", "today")
+    today = datetime.date.today()
+    
+    # Si se proporcionan fechas específicas, usarlas
+    if start_date_param and end_date_param:
+        start_date = start_date_param
+        end_date = end_date_param
+        if start_date == end_date:
+            label = f"{start_date}"
+        else:
+            label = f"{start_date} a {end_date}"
+    elif start_date_param:
+        start_date = start_date_param
+        end_date = today.isoformat()
+        label = f"desde {start_date}"
+    else:
+        # Usar periodos predefinidos
+        if period == "today":
+            start_date = today.isoformat()
+            end_date = today.isoformat()
+            label = "HOY"
+        elif period == "yesterday":
+            yesterday = today - datetime.timedelta(days=1)
+            start_date = yesterday.isoformat()
+            end_date = yesterday.isoformat()
+            label = "AYER"
+        elif period == "week":
+            start_date = (today - datetime.timedelta(days=7)).isoformat()
+            end_date = today.isoformat()
+            label = "ULTIMOS 7 DIAS"
+        elif period == "month":
+            start_date = (today - datetime.timedelta(days=30)).isoformat()
+            end_date = today.isoformat()
+            label = "ULTIMOS 30 DIAS"
+        else:
+            start_date = today.isoformat()
+            end_date = today.isoformat()
+            label = "HOY"
+    
+    # Construir filtro con rango de fechas
+    # Shopify usa ISO 8601, zona horaria Colombia (GMT-05:00)
+    created_at_min = f"{start_date}T00:00:00-05:00"
+    created_at_max = f"{end_date}T23:59:59-05:00"
+    
+    data = await api_get("orders.json", {
+        "created_at_min": created_at_min,
+        "created_at_max": created_at_max,
+        "status": "any",
+        "limit": 250
+    })
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    orders = data.get("orders", [])
+    total = sum(float(o.get("total_price", 0)) for o in orders)
+    paid_orders = [o for o in orders if o.get("financial_status") == "paid"]
+    paid_total = sum(float(o.get("total_price", 0)) for o in paid_orders)
+    
+    # Texto formateado
+    result_text = f"""📊 VENTAS {label}:
+
+💰 Total bruto: ${total:,.2f}
+✅ Total pagado: ${paid_total:,.2f}
+📦 Pedidos totales: {len(orders)}
+✅ Pedidos pagados: {len(paid_orders)}
+📈 Ticket promedio: ${(total/len(orders) if orders else 0):,.2f}"""
+    
+    # JSON estructurado para el dashboard
+    json_data = {
+        "total_orders": len(orders),
+        "total_amount": round(total, 2),
+        "paid_orders": len(paid_orders),
+        "paid_amount": round(paid_total, 2),
+        "avg_ticket": round(total/len(orders), 2) if orders else 0,
+        "period": label,
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    
+    return f"{result_text}\n\n---JSON---\n{json.dumps(json_data)}"
+
+async def get_all_products(args: dict) -> str:
+    limit = min(args.get("limit", 50), 250)
+    data = await api_get("products.json", {"limit": limit})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    products = data.get("products", [])
+    if not products:
+        return "No hay productos en la tienda."
+    
+    result = f"🏪 PRODUCTOS ({len(products)}):\n\n"
+    
+    for p in products:
+        title = p.get("title", "Sin nombre")
+        status = p.get("status", "unknown")
+        variants = p.get("variants", [])
+        
+        if variants:
+            price = variants[0].get("price", "0")
+            total_inv = sum(v.get("inventory_quantity", 0) for v in variants)
+        else:
+            price = "0"
+            total_inv = 0
+        
+        status_emoji = "✅" if status == "active" else "⏸️"
+        inv_warning = "⚠️" if total_inv < 5 else ""
+        
+        result += f"{status_emoji} {title}\n   💵 ${price} | 📦 {total_inv} unidades {inv_warning}\n\n"
+    
+    return result
+
+async def check_product_inventory(args: dict) -> str:
+    product_name = args.get("product_name", "")
+    data = await api_get("products.json")
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    products = data.get("products", [])
+    found = []
+    
+    for p in products:
+        if product_name.lower() in p["title"].lower():
+            variants = p.get("variants", [])
+            variant_info = []
+            for v in variants:
+                variant_info.append(f"   - {v.get('title', 'Default')}: {v.get('inventory_quantity', 0)} unidades")
+            found.append(f"📦 {p['title']}\n" + "\n".join(variant_info))
+    
+    if not found:
+        return f"No encontre productos con '{product_name}'"
+    
+    return "🔍 INVENTARIO:\n\n" + "\n\n".join(found)
+
+async def get_low_stock_products(args: dict) -> str:
+    threshold = args.get("threshold", 5)
+    data = await api_get("products.json", {"limit": 250})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    products = data.get("products", [])
+    low_stock = []
+    
+    for p in products:
+        if p.get("status") != "active":
+            continue
+        variants = p.get("variants", [])
+        total_inv = sum(v.get("inventory_quantity", 0) for v in variants)
+        if total_inv < threshold:
+            low_stock.append(f"⚠️ {p['title']}: {total_inv} unidades")
+    
+    if not low_stock:
+        return f"✅ No hay productos con menos de {threshold} unidades."
+    
+    return f"🚨 STOCK BAJO (menos de {threshold}):\n\n" + "\n".join(low_stock)
+
+async def get_recent_customers(args: dict) -> str:
+    limit = min(args.get("limit", 10), 50)
+    data = await api_get("customers.json", {"limit": limit, "order": "created_at desc"})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    customers = data.get("customers", [])
+    if not customers:
+        return "No hay clientes registrados."
+    
+    result = f"👥 CLIENTES RECIENTES ({len(customers)}):\n\n"
+    
+    for c in customers:
+        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "Sin nombre"
+        email = c.get("email", "Sin email")
+        phone = c.get("phone", "Sin telefono")
+        orders = c.get("orders_count", 0)
+        total = float(c.get("total_spent", 0))
+        
+        result += f"👤 {name}\n   📧 {email} | 📱 {phone}\n   🛒 {orders} pedidos | 💰 ${total:,.2f}\n\n"
+    
+    return result
+
+async def search_customer(args: dict) -> str:
+    query = args.get("query", "")
+    data = await api_get("customers/search.json", {"query": query})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    customers = data.get("customers", [])
+    if not customers:
+        return f"No encontre clientes con '{query}'"
+    
+    result = "🔍 CLIENTES ENCONTRADOS:\n\n"
+    
+    for c in customers:
+        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
+        result += f"👤 {name}\n   📧 {c.get('email', 'N/A')} | 📱 {c.get('phone', 'N/A')}\n   🛒 {c.get('orders_count', 0)} pedidos | 💰 ${float(c.get('total_spent', 0)):,.2f}\n\n"
+    
+    return result
+
+async def get_top_customers(args: dict) -> str:
+    limit = min(args.get("limit", 10), 50)
+    data = await api_get("customers.json", {"limit": 250})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    customers = data.get("customers", [])
+    customers.sort(key=lambda c: float(c.get("total_spent", 0)), reverse=True)
+    top = customers[:limit]
+    
+    if not top:
+        return "No hay clientes con compras."
+    
+    result = f"🏆 TOP {len(top)} CLIENTES:\n\n"
+    
+    for i, c in enumerate(top, 1):
+        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "Sin nombre"
+        result += f"{i}. {name}: ${float(c.get('total_spent', 0)):,.2f} ({c.get('orders_count', 0)} pedidos)\n"
+    
+    return result
+
+async def get_shop_info(args: dict) -> str:
+    data = await api_get("shop.json")
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    shop = data.get("shop", {})
+    
+    return f"""🏪 INFO DE LA TIENDA:
+
+📛 Nombre: {shop.get('name', 'N/A')}
+🌐 Dominio: {shop.get('domain', 'N/A')}
+🔗 Shopify URL: {shop.get('myshopify_domain', 'N/A')}
+📧 Email: {shop.get('email', 'N/A')}
+📱 Telefono: {shop.get('phone', 'N/A')}
+💰 Moneda: {shop.get('currency', 'N/A')}
+🌍 Zona horaria: {shop.get('timezone', 'N/A')}
+📊 Plan: {shop.get('plan_name', 'N/A')}
+📅 Creada: {shop.get('created_at', 'N/A')[:10]}"""
+
+async def get_shop_balance(args: dict) -> str:
+    data = await api_get("shopify_payments/balance.json")
+    
+    if "error" in data:
+        return """💳 BALANCE:
+
+Para ver el balance completo, revisa:
+Shopify Admin > Configuracion > Pagos
+
+La API tiene acceso limitado a info financiera."""
+    
+    balance = data.get("balance", [])
+    result = "💳 BALANCE SHOPIFY PAYMENTS:\n\n"
+    for b in balance:
+        result += f"   {b.get('currency', 'USD')}: ${float(b.get('amount', 0)):,.2f}\n"
+    return result
+
+async def get_best_selling_products(args: dict) -> str:
+    limit = min(args.get("limit", 10), 50)
+    data = await api_get("orders.json", {"limit": 250, "status": "any"})
+    
+    if "error" in data:
+        return f"Error: {data['error']}"
+    
+    orders = data.get("orders", [])
+    product_sales = {}
+    
+    for order in orders:
+        for item in order.get("line_items", []):
+            name = item.get("name", "Producto")
+            qty = item.get("quantity", 1)
+            product_sales[name] = product_sales.get(name, 0) + qty
+    
+    sorted_products = sorted(product_sales.items(), key=lambda x: x[1], reverse=True)[:limit]
+    
+    if not sorted_products:
+        return "No hay datos de ventas."
+    
+    result = f"🏆 TOP {len(sorted_products)} MAS VENDIDOS:\n\n"
+    for i, (name, qty) in enumerate(sorted_products, 1):
+        result += f"{i}. {name}: {qty} vendidos\n"
+    
+    return result
+
+# ========== DISPATCHER ==========
+
+TOOL_HANDLERS = {
+    "get_total_sales_today": get_total_sales_today,
+    "get_recent_orders": get_recent_orders,
+    "get_order_details": get_order_details,
+    "get_sales_by_period": get_sales_by_period,
+    "get_all_products": get_all_products,
+    "check_product_inventory": check_product_inventory,
+    "get_low_stock_products": get_low_stock_products,
+    "get_recent_customers": get_recent_customers,
+    "search_customer": search_customer,
+    "get_top_customers": get_top_customers,
+    "get_shop_info": get_shop_info,
+    "get_shop_balance": get_shop_balance,
+    "get_best_selling_products": get_best_selling_products,
+}
+
+async def execute_tool(name: str, args: dict) -> str:
+    handler = TOOL_HANDLERS.get(name)
+    if handler:
+        try:
+            return await handler(args)
+        except Exception as e:
+            return f"Error ejecutando {name}: {str(e)}"
+    return f"Herramienta {name} no encontrada"
+
+# ========== ENDPOINTS ==========
+
+async def http_tools(request):
+    return JSONResponse({"tools": TOOLS})
+
+async def http_call_tool(request):
+    body = await request.json()
+    name = body.get("name", "")
+    args = body.get("arguments", {})
+    result = await execute_tool(name, args)
+    return JSONResponse({"result": result})
+
+async def sse_endpoint(request):
+    queue = asyncio.Queue()
+    session_id = str(id(queue))
+    sessions[session_id] = queue
+    
+    async def event_generator():
+        try:
+            yield {"event": "endpoint", "data": f"/messages/{session_id}"}
+            while True:
+                data = await queue.get()
+                yield {"event": "message", "data": json.dumps(data)}
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sessions.pop(session_id, None)
+    
+    return EventSourceResponse(event_generator())
+
+async def messages_endpoint(request):
+    session_id = request.path_params["session_id"]
+    if session_id not in sessions:
+        return Response("Session not found", status_code=404)
+    
+    body = await request.json()
+    method = body.get("method", "")
+    msg_id = body.get("id")
+    
+    if method == "initialize":
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "shopify-mcp", "version": "3.0.0"}}}
+    elif method == "tools/list":
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+    elif method == "tools/call":
+        params = body.get("params", {})
+        name = params.get("name", "")
+        args = params.get("arguments", {})
+        result = await execute_tool(name, args)
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": result}]}}
+    else:
+        response = {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+    
+    if response and msg_id:
+        await sessions[session_id].put(response)
+    
+    return Response("OK")
+
+async def health(request):
+    return Response("OK")
+
+app = Starlette(routes=[
+    Route("/", health),
+    Route("/health", health),
+    Route("/tools", http_tools),
+    Route("/call", http_call_tool, methods=["POST"]),
+    Route("/sse", sse_endpoint),
+    Route("/messages/{session_id}", messages_endpoint, methods=["POST"]),
+])
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 3000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
